@@ -1,4 +1,4 @@
-import 'dart:typed_data';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_barcode_scanning/google_mlkit_barcode_scanning.dart';
@@ -6,16 +6,11 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
-import 'package:flutter/foundation.dart';
-import 'package:project_flutter/services/notification_service.dart';
+import '../services/notification_service.dart';
 
 class ScanAddItemScreen extends StatefulWidget {
   final String categoryId;
-
-  const ScanAddItemScreen({
-    super.key,
-    required this.categoryId,
-  });
+  const ScanAddItemScreen({super.key, required this.categoryId});
 
   @override
   State<ScanAddItemScreen> createState() => _ScanAddItemScreenState();
@@ -28,8 +23,8 @@ class _ScanAddItemScreenState extends State<ScanAddItemScreen> {
   final TextEditingController nameController = TextEditingController();
 
   bool _isPermissionGranted = false;
-  bool _isScanning = true;
   bool _isCameraInitialized = false;
+  bool _isProcessing = false;
 
   String? scannedBarcode;
   DateTime? expiryDate;
@@ -40,22 +35,15 @@ class _ScanAddItemScreenState extends State<ScanAddItemScreen> {
   void initState() {
     super.initState();
     _barcodeScanner = BarcodeScanner();
-    _requestPermissionAndInit();
+    _init();
   }
 
-  // 🔐 Camera permission
-  Future<void> _requestPermissionAndInit() async {
+  Future<void> _init() async {
     final status = await Permission.camera.request();
-    if (status.isGranted) {
-      _isPermissionGranted = true;
-      await _initCamera();
-    } else {
-      setState(() => _isPermissionGranted = false);
-    }
-  }
+    if (!status.isGranted) return;
 
-  // 📷 Camera init
-  Future<void> _initCamera() async {
+    _isPermissionGranted = true;
+
     final cameras = await availableCameras();
     _cameraController = CameraController(
       cameras.first,
@@ -65,62 +53,29 @@ class _ScanAddItemScreenState extends State<ScanAddItemScreen> {
 
     await _cameraController!.initialize();
     setState(() => _isCameraInitialized = true);
-
-    _startImageStream();
   }
 
-  // 🔄 Scan frames
-  void _startImageStream() {
-    _cameraController!.startImageStream((CameraImage image) async {
-      if (!_isScanning) return;
+  Future<void> _scanBarcode() async {
+    if (_isProcessing) return;
+    _isProcessing = true;
 
-      final inputImage = _convertCameraImage(image);
+    try {
+      final picture = await _cameraController!.takePicture();
+      final inputImage = InputImage.fromFilePath(picture.path);
       final barcodes = await _barcodeScanner.processImage(inputImage);
 
       if (barcodes.isNotEmpty) {
-        setState(() {
-          scannedBarcode = barcodes.first.rawValue;
-          _isScanning = false;
-        });
-
-        await _cameraController!.stopImageStream();
+        setState(() => scannedBarcode = barcodes.first.rawValue);
+      } else {
+        _showSnack("No barcode detected");
       }
-    });
-  }
-
-  // 🔁 Convert camera image
-  InputImage _convertCameraImage(CameraImage image) {
-    final WriteBuffer buffer = WriteBuffer();
-    for (final plane in image.planes) {
-      buffer.putUint8List(plane.bytes);
+    } catch (_) {
+      _showSnack("Scan failed");
+    } finally {
+      _isProcessing = false;
     }
-
-    final bytes = buffer.done().buffer.asUint8List();
-    final imageSize =
-    Size(image.width.toDouble(), image.height.toDouble());
-
-    final rotation =
-        InputImageRotationValue.fromRawValue(
-          _cameraController!.description.sensorOrientation,
-        ) ??
-            InputImageRotation.rotation0deg;
-
-    final format =
-        InputImageFormatValue.fromRawValue(image.format.raw) ??
-            InputImageFormat.nv21;
-
-    return InputImage.fromBytes(
-      bytes: bytes,
-      metadata: InputImageMetadata(
-        size: imageSize,
-        rotation: rotation,
-        format: format,
-        bytesPerRow: image.planes.first.bytesPerRow,
-      ),
-    );
   }
 
-  // 📅 Pick expiry
   Future<void> _pickExpiryDate() async {
     final picked = await showDatePicker(
       context: context,
@@ -128,53 +83,42 @@ class _ScanAddItemScreenState extends State<ScanAddItemScreen> {
       firstDate: DateTime.now(),
       lastDate: DateTime(2100),
     );
-
-    if (picked != null) {
-      setState(() => expiryDate = picked);
-    }
+    if (picked != null) setState(() => expiryDate = picked);
   }
 
-  // 💾 Save item
   Future<void> _saveItem() async {
-    if (nameController.text.trim().isEmpty ||
+    if (nameController.text.isEmpty ||
         scannedBarcode == null ||
         expiryDate == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("All fields are required")),
-      );
+      _showSnack("All fields required");
       return;
     }
 
-    try {
-      // 1️⃣ Save to Firestore
-      await FirebaseFirestore.instance
-          .collection('users')
-          .doc(uid)
-          .collection('categories')
-          .doc(widget.categoryId)
-          .collection('items')
-          .add({
-        'name': nameController.text.trim(),
-        'barcode': scannedBarcode,
-        'expiryDate': Timestamp.fromDate(expiryDate!),
-        'createdAt': Timestamp.now(),
-      });
+    await FirebaseFirestore.instance
+        .collection('users')
+        .doc(uid)
+        .collection('categories')
+        .doc(widget.categoryId)
+        .collection('items')
+        .add({
+      'name': nameController.text.trim(),
+      'barcode': scannedBarcode,
+      'expiryDate': Timestamp.fromDate(expiryDate!),
+      'createdAt': Timestamp.now(),
+    });
 
-      // 2️⃣ Schedule reminders
-      NotificationService.scheduleExpiryReminders(
-        itemName: nameController.text.trim(),
-        expiryDate: expiryDate!,
-      );
+    NotificationService.scheduleExpiryReminders(
+      itemName: nameController.text.trim(),
+      expiryDate: expiryDate!,
+    );
 
-      // 3️⃣ Back to items screen
-      if (!mounted) return;
-      Navigator.pop(context);
+    if (!mounted) return;
+    Navigator.pop(context);
+  }
 
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Failed to save item")),
-      );
-    }
+  void _showSnack(String msg) {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(msg)));
   }
 
   @override
@@ -201,41 +145,79 @@ class _ScanAddItemScreenState extends State<ScanAddItemScreen> {
 
     return Scaffold(
       appBar: AppBar(title: const Text("Scan Item")),
-      body: _isScanning
-          ? CameraPreview(_cameraController!)
-          : Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            Text("Barcode: ${scannedBarcode ?? ""}"),
-            const SizedBox(height: 12),
+      body: SafeArea(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            return SingleChildScrollView(
+              padding: const EdgeInsets.all(16),
+              child: ConstrainedBox(
+                constraints:
+                BoxConstraints(minHeight: constraints.maxHeight),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    // 📷 Responsive Camera Preview
+                    AspectRatio(
+                      aspectRatio:
+                      _cameraController!.value.aspectRatio,
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(12),
+                        child: CameraPreview(_cameraController!),
+                      ),
+                    ),
 
-            TextField(
-              controller: nameController,
-              decoration:
-              const InputDecoration(labelText: "Item Name"),
-            ),
+                    const SizedBox(height: 16),
 
-            const SizedBox(height: 12),
-            ListTile(
-              title: Text(
-                expiryDate == null
-                    ? "Select Expiry Date"
-                    : DateFormat.yMMMd().format(expiryDate!),
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.qr_code_scanner),
+                      label: const Text("Scan Barcode"),
+                      onPressed: _scanBarcode,
+                    ),
+
+                    if (scannedBarcode != null) ...[
+                      const SizedBox(height: 12),
+                      Text(
+                        "Barcode: $scannedBarcode",
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+
+                    const SizedBox(height: 16),
+
+                    TextField(
+                      controller: nameController,
+                      textInputAction: TextInputAction.next,
+                      decoration:
+                      const InputDecoration(labelText: "Item Name"),
+                    ),
+
+                    const SizedBox(height: 12),
+
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: Text(
+                        expiryDate == null
+                            ? "Select Expiry Date"
+                            : DateFormat.yMMMd().format(expiryDate!),
+                      ),
+                      trailing:
+                      const Icon(Icons.calendar_today),
+                      onTap: _pickExpiryDate,
+                    ),
+
+                    const SizedBox(height: 20),
+
+                    ElevatedButton(
+                      onPressed: _saveItem,
+                      child: const Text("Save Item"),
+                    ),
+                  ],
+                ),
               ),
-              trailing: const Icon(Icons.calendar_today),
-              onTap: _pickExpiryDate,
-            ),
-
-            const SizedBox(height: 20),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: _saveItem,
-                child: const Text("Save Item"),
-              ),
-            ),
-          ],
+            );
+          },
         ),
       ),
     );
